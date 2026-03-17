@@ -1,4 +1,6 @@
 from flask import Flask, jsonify, request, make_response
+from flask_cors import CORS
+
 import pymysql
 import bcrypt
 from datetime import datetime,timedelta
@@ -9,13 +11,12 @@ import numpy as np
 import os
 import scipy
 import sklearn
-import torch
-from torch_geometric.data import Batch
 from dotenv import load_dotenv
 import pandas as pd
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import google.generativeai as genai
 
 
 
@@ -40,10 +41,21 @@ if not os.path.exists(encoder_path):
 xgb_model = joblib.load(model_path)
 xgb_encoders = joblib.load(encoder_path)
 
-print("✅ XGBoost model loaded successfully")
+print("XGBoost model loaded successfully")
 
 #create flask name
 app = Flask(__name__)
+CORS(app)
+
+# ---------- CONFIGURE GEMINI AI ----------
+GEMINI_API_KEY = "AIzaSyCe5a9q8R5G58V2mufVfXcU6AezWyd4RTQ"
+genai.configure(api_key=GEMINI_API_KEY)
+# Initialize the model with a specialized system instruction
+chat_model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    system_instruction="You are the OvaDrugX AI Support Specialist. You help researchers with drug screening, target discovery, molecular docking, and technical app support. Be professional, concise, and helpful."
+)
+
 
 # ---------- LOAD MODELS ----------
 enc = joblib.load("encoders.pkl")
@@ -62,12 +74,14 @@ dataset_path = os.path.join(BASE_DIR, "protein_and_gene.xlsx")
 try:
     target_db = pd.read_excel(dataset_path)
     target_db = target_db.fillna("Unknown")
-    print("✅ Target Dataset loaded into memory")
+    print("Target Dataset loaded into memory")
 except Exception as e:
-    print("⚠ Could not load target dataset:", e)
+    print("Could not load target dataset:", e)
     target_db = None
 
 try:
+    import torch
+    from torch_geometric.data import Batch
     from train_gnn import GNN, smiles_to_graph
     
     gnn_model_path = os.path.join(BASE_DIR, "gnn_model.pth")
@@ -75,12 +89,12 @@ try:
         gnn_model = GNN(hidden_channels=64)
         gnn_model.load_state_dict(torch.load(gnn_model_path, map_location=torch.device('cpu'), weights_only=True))
         gnn_model.eval()
-        print("✅ GNN Model loaded")
+        print("GNN Model loaded")
     else:
         gnn_model = None
-        print("⚠ GNN Model not found (run train_gnn.py)")
+        print("GNN Model not found (run train_gnn.py)")
 except Exception as e:
-    print("⚠ Could not load GNN model:", e)
+    print("Could not load GNN model:", e)
     gnn_model = None
 
 # ---------- LOAD TRAINED SVM MODEL ----------
@@ -102,7 +116,7 @@ svm_model_obj = joblib.load(svm_model_path)
 svm_scaler = joblib.load(svm_scaler_path)
 svm_encoders = joblib.load(svm_encoder_path)
 
-print("✅ SVM model loaded successfully")
+print("SVM model loaded successfully")
 
 
 
@@ -123,7 +137,7 @@ def get_db_connection():
 # ---------- Home route ----------
 @app.route("/")
 def home():
-    return "Flask server running 🚀"
+    return "Flask server running"
 
 
 # ---------- Test DB connection ----------
@@ -498,7 +512,7 @@ def verify():
 def create_account():
 
     # =========================
-    # 1️⃣ Check JSON request
+    # 1 Check JSON request
     # =========================
     if not request.is_json:
         return jsonify({
@@ -509,7 +523,7 @@ def create_account():
     data = request.get_json()
 
     # =========================
-    # 2️⃣ Extract fields
+    # 2 Extract fields
     # =========================
     full_name = (data.get("full_name") or "").strip()
     email = (data.get("email") or "").strip()
@@ -518,7 +532,7 @@ def create_account():
     license_number = (data.get("license_number") or "").strip()
 
     # =========================
-    # 3️⃣ Validations
+    # 3 Validations
     # =========================
     if not full_name:
         return jsonify({"status": "error", "message": "Full name required"}), 400
@@ -530,7 +544,7 @@ def create_account():
         return jsonify({"status": "error", "message": "Invalid email"}), 400
 
     # =========================
-    # 4️⃣ Database Insert
+    # 4 Database Insert
     # =========================
     conn = None
     cursor = None
@@ -692,9 +706,15 @@ def get_account():
         cursor = conn.cursor(pymysql.cursors.DictCursor)
 
         cursor.execute("""
-            SELECT full_name, gender, department, license_number
-            FROM accounts
-            WHERE email=%s
+            SELECT 
+                u.full_name, 
+                IFNULL(a.gender, 'Others') as gender, 
+                IFNULL(a.department, 'Not Specified') as department, 
+                IFNULL(a.license_number, '--') as license_number, 
+                u.mobile
+            FROM users u
+            LEFT JOIN accounts a ON u.email = a.email
+            WHERE u.email=%s
         """, (email,))
 
         account = cursor.fetchone()
@@ -727,8 +747,9 @@ def update_account():
     email = (data.get("email") or "").strip()
     full_name = (data.get("full_name") or "").strip()
     gender = (data.get("gender") or "").strip()
-    department = (data.get("department") or "").strip()
+    department = (data.get("department") or data.get("bio") or "").strip()
     license_number = (data.get("license_number") or "").strip()
+    mobile = (data.get("mobile") or "").strip()
 
     if not email or not full_name:
         return jsonify({"status": "error", "message": "Email and Full Name are required"}), 400
@@ -740,28 +761,37 @@ def update_account():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Update the account details
-        sql = """
-            UPDATE accounts
-            SET full_name=%s, gender=%s, department=%s, license_number=%s
+        # Upsert logic for 'accounts' table
+        cursor.execute("SELECT id FROM accounts WHERE email=%s", (email,))
+        exists = cursor.fetchone()
+
+        if exists:
+            sql = """
+                UPDATE accounts
+                SET full_name=%s, gender=%s, department=%s, license_number=%s
+                WHERE email=%s
+            """
+            cursor.execute(sql, (full_name, gender, department, license_number, email))
+        else:
+            sql = """
+                INSERT INTO accounts (full_name, email, gender, department, license_number)
+                VALUES (%s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (full_name, email, gender, department, license_number))
+
+        # Update the details in main 'users' table
+        user_sql = """
+            UPDATE users 
+            SET full_name=%s, mobile=%s, updated_at=%s
             WHERE email=%s
         """
-        affected_rows = cursor.execute(sql, (full_name, gender, department, license_number, email))
-
-        if affected_rows == 0:
-            cursor.execute("SELECT id FROM accounts WHERE email=%s", (email,))
-            if not cursor.fetchone():
-                return jsonify({"status": "error", "message": "Account target not found in accounts table"}), 404
-            
-        conn.commit()
-
-        # Additionally, update the full_name in the main 'users' table to keep them in sync
-        cursor.execute("UPDATE users SET full_name=%s WHERE email=%s", (full_name, email))
+        cursor.execute(user_sql, (full_name, mobile, datetime.now(), email))
+        
         conn.commit()
 
         return jsonify({
             "status": "success",
-            "message": "Account updated successfully"
+            "message": "Profile updated successfully"
         }), 200
 
     except Exception as e:
@@ -771,6 +801,7 @@ def update_account():
             cursor.close()
         if conn:
             conn.close()
+
 
 
 @app.route("/verify-reset-otp", methods=["POST"])
@@ -1257,7 +1288,7 @@ def screen_drug():
 def predict_xgb():
 
     # ===============================
-    # 1️⃣ Content-Type Validation
+    # 1 Content-Type Validation
     # ===============================
     if not request.is_json:
         return jsonify({
@@ -1266,7 +1297,7 @@ def predict_xgb():
         }), 415
 
     # ===============================
-    # 2️⃣ Parse JSON Safely
+    # 2 Parse JSON Safely
     # ===============================
     try:
         data = request.get_json()
@@ -1283,7 +1314,7 @@ def predict_xgb():
         }), 400
 
     # ===============================
-    # 3️⃣ Model Loaded Validation
+    # 3 Model Loaded Validation
     # ===============================
     if xgb_model is None:
         return jsonify({
@@ -1297,7 +1328,7 @@ def predict_xgb():
         invalid_fields = []
 
         # ===============================
-        # 4️⃣ Feature Validation
+        # 4 Feature Validation
         # ===============================
         for feature in xgb_model.feature_names_in_:
 
@@ -1310,7 +1341,7 @@ def predict_xgb():
             value = data[feature]
 
             # ===============================
-            # 5️⃣ Categorical Encoding
+            # 5 Categorical Encoding
             # ===============================
             if feature in xgb_encoders:
                 encoder = xgb_encoders[feature]
@@ -1324,7 +1355,7 @@ def predict_xgb():
                     }), 400
 
             # ===============================
-            # 6️⃣ Numeric Validation
+            # 6 Numeric Validation
             # ===============================
             try:
                 value = float(value)
@@ -1349,12 +1380,12 @@ def predict_xgb():
             }), 400
 
         # ===============================
-        # 7️⃣ Create DataFrame (Correct Order)
+        # 7 Create DataFrame (Correct Order)
         # ===============================
         input_df = pd.DataFrame([input_data])[xgb_model.feature_names_in_]
 
         # ===============================
-        # 8️⃣ Prediction
+        # 8 Prediction
         # ===============================
         prediction = xgb_model.predict(input_df)[0]
 
@@ -1375,6 +1406,46 @@ def predict_xgb():
             "message": "Server error",
             "details": str(e)
         }), 500
+
+@app.route("/support-chat", methods=["POST"])
+def support_chat():
+    if not request.is_json:
+        return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 415
+
+    data = request.get_json()
+    user_message = (data.get("message") or "").strip()
+
+    if not user_message:
+        return jsonify({"status": "error", "message": "Message is required"}), 400
+
+    try:
+        # Generate responsive AI reply using Gemini
+        response = chat_model.generate_content(user_message)
+        reply_text = response.text.strip()
+        
+        return jsonify({
+            "status": "success",
+            "message": "AI Response generated",
+            "reply": reply_text
+        }), 200
+
+    except Exception as e:
+        # Graceful fallback to keyword logic if API fails
+        lower_msg = user_message.lower()
+        fallback_reply = "That's an interesting query! As a specialized assistant for OvaDrugX, I can help you navigate our screening tools, target discovery, and AI-driven insights. Could you elaborate a bit more?"
+        
+        if any(word in lower_msg for word in ["hi", "hello", "hey"]):
+            fallback_reply = "Hello! I am your OvaDrugX Support Specialist. How can I assist you with your research or technical queries today?"
+        elif any(word in lower_msg for word in ["drug", "medicine", "compound", "protein"]):
+            fallback_reply = "Our platform uses advanced ML models like XGBoost and GNNs. Are you looking for a specific target analysis?"
+
+        return jsonify({
+            "status": "success",
+            "message": "Fallback Response (AI Service Unavailable)",
+            "reply": fallback_reply,
+            "error_details": str(e)
+        }), 200
+
 
 # ---------- Run server ----------
 if __name__ == "__main__":
